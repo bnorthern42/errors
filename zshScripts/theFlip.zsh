@@ -1,6 +1,6 @@
 # theflip.zsh
-# Deterministic project archaeology for C#/.NET and JavaScript/TypeScript.
-# Commands: tfcs, tfjs
+# Deterministic project archaeology for C#/.NET, JavaScript/TypeScript, and XML.
+# Commands: tfcs, tfjs, tfx
 #
 # Core dependencies:
 #   rg fd tokei git
@@ -16,7 +16,7 @@
 # It does not run format/fix, migrations, package installs, database updates, or writes.
 #
 # Install:
-#   source /path/to/theflip.zsh
+#   source /path/to/theFlip.zsh
 # or:
 #   echo 'source /path/to/theflip.zsh' >> ~/.zshrc
 
