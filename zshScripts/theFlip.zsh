@@ -3528,3 +3528,2480 @@ EOF
 
     esac
 }
+# ============================================================================
+# TFHOW - HOW TF DO I RUN THIS?
+# ============================================================================
+#
+# Deterministic startup archaeology.
+#
+# Usage:
+#   tfhow
+#   tfhow startup
+#   tfhow blockers
+#   tfhow config
+#   tfhow infra
+#   tfhow db
+#   tfhow migrations
+#   tfhow docker
+#   tfhow secrets
+#   tfhow ports
+#   tfhow env
+#   tfhow order
+#   tfhow evidence
+#   tfhow why THING
+#
+# READ ONLY:
+#   - does NOT run the application
+#   - does NOT start Docker
+#   - does NOT apply migrations
+#   - does NOT modify configuration
+#   - does NOT contact databases/services
+#
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# INTERNAL HELPERS
+# ----------------------------------------------------------------------------
+
+_tfhow_files() {
+    fd -t f \
+        --exclude bin \
+        --exclude obj \
+        --exclude node_modules \
+        --exclude .git \
+        . 2>/dev/null
+}
+
+
+_tfhow_rg() {
+    rg \
+        --glob '!**/bin/**' \
+        --glob '!**/obj/**' \
+        --glob '!**/node_modules/**' \
+        --glob '!**/.git/**' \
+        "$@"
+}
+
+
+_tfhow_first() {
+    _tfhow_rg "$@" 2>/dev/null | head -1
+}
+
+
+_tfhow_count_files() {
+    _tfhow_rg -l "$@" . 2>/dev/null |
+        wc -l |
+        tr -d ' '
+}
+
+
+_tfhow_count_matches() {
+    _tfhow_rg "$@" . 2>/dev/null |
+        wc -l |
+        tr -d ' '
+}
+
+
+_tfhow_yesno() {
+    if (( $1 > 0 )); then
+        printf '%sYES%s' "$TF_BGREEN" "$TF_RESET"
+    else
+        printf '%sNO%s' "$TF_DIM" "$TF_RESET"
+    fi
+}
+
+
+_tfhow_header() {
+    printf '\n  %s%s%s%s\n' \
+        "$TF_BOLD" "$TF_BMAGENTA" "$1" "$TF_RESET"
+}
+
+
+_tfhow_high() {
+    printf '  %sHIGH%s    %s\n' \
+        "$TF_BRED" "$TF_RESET" "$1"
+}
+
+
+_tfhow_medium() {
+    printf '  %sMEDIUM%s  %s\n' \
+        "$TF_BYELLOW" "$TF_RESET" "$1"
+}
+
+
+_tfhow_low() {
+    printf '  %sLOW%s     %s\n' \
+        "$TF_BBLUE" "$TF_RESET" "$1"
+}
+
+
+_tfhow_fact() {
+    printf '  %s✓%s %s\n' \
+        "$TF_BGREEN" "$TF_RESET" "$1"
+}
+
+
+_tfhow_question() {
+    printf '  %s?%s %s\n' \
+        "$TF_BYELLOW" "$TF_RESET" "$1"
+}
+
+
+_tfhow_step() {
+    local n="$1"
+    shift
+
+    printf '  %s%s%s. %s\n' \
+        "$TF_BCYAN" "$n" "$TF_RESET" "$*"
+}
+
+
+_tfhow_path_exists() {
+    [[ -e "$1" ]]
+}
+
+
+_tfhow_csprojects() {
+    fd -e csproj \
+        --exclude bin \
+        --exclude obj \
+        . 2>/dev/null
+}
+
+
+_tfhow_startup_candidates() {
+    local file=""
+
+    while IFS= read -r file; do
+
+        [[ -z "$file" ]] && continue
+
+        local score=0
+        local reason=""
+
+        if [[ -f "$(dirname "$file")/Program.cs" ]]; then
+            (( score += 5 ))
+            reason+="Program.cs "
+        fi
+
+        if _tfhow_rg -q \
+            '<Project[[:space:]][^>]*Sdk="Microsoft\.NET\.Sdk\.Web"' \
+            "$file" 2>/dev/null
+        then
+            (( score += 5 ))
+            reason+="WebSDK "
+        fi
+
+        if _tfhow_rg -q \
+            '<OutputType>[[:space:]]*Exe[[:space:]]*</OutputType>' \
+            "$file" 2>/dev/null
+        then
+            (( score += 3 ))
+            reason+="Exe "
+        fi
+
+        if _tfhow_rg -q \
+            'Microsoft\.Extensions\.Hosting|AspNetCore' \
+            "$file" 2>/dev/null
+        then
+            (( score += 2 ))
+            reason+="Host "
+        fi
+
+        case "$file" in
+            *AppHost*.csproj)
+                (( score += 10 ))
+                reason+="AspireAppHost "
+                ;;
+        esac
+
+        if (( score > 0 )); then
+            printf '%s|%s|%s\n' "$score" "$file" "$reason"
+        fi
+
+    done < <(_tfhow_csprojects) |
+        sort -t'|' -k1,1nr
+}
+
+
+_tfhow_primary_startup() {
+    _tfhow_startup_candidates |
+        head -1 |
+        cut -d'|' -f2
+}
+
+
+_tfhow_framework() {
+    local project="$1"
+
+    [[ -z "$project" ]] && return
+
+    local framework=""
+
+    framework="$(
+        sed -n \
+            's:.*<TargetFramework>\([^<]*\)</TargetFramework>.*:\1:p' \
+            "$project" |
+        head -1
+    )"
+
+    if [[ -z "$framework" ]]; then
+        framework="$(
+            sed -n \
+                's:.*<TargetFrameworks>\([^<]*\)</TargetFrameworks>.*:\1:p' \
+                "$project" |
+            head -1
+        )"
+    fi
+
+    printf '%s' "$framework"
+}
+
+
+_tfhow_project_type() {
+    local project="$1"
+
+    if [[ "$project" == *AppHost*.csproj ]]; then
+        printf 'Aspire AppHost'
+        return
+    fi
+
+    if _tfhow_rg -q \
+        '<Project[[:space:]][^>]*Sdk="Microsoft\.NET\.Sdk\.Web"' \
+        "$project" 2>/dev/null
+    then
+        printf 'ASP.NET Core'
+        return
+    fi
+
+    if _tfhow_rg -q \
+        '<OutputType>[[:space:]]*Exe[[:space:]]*</OutputType>' \
+        "$project" 2>/dev/null
+    then
+        printf 'Console / executable'
+        return
+    fi
+
+    printf '.NET project'
+}
+
+
+_tfhow_appsettings() {
+    fd \
+        '^appsettings(\..+)?\.json$' \
+        --exclude bin \
+        --exclude obj \
+        . 2>/dev/null |
+        sort
+}
+
+
+_tfhow_launchsettings() {
+    fd \
+        '^launchSettings\.json$' \
+        --exclude bin \
+        --exclude obj \
+        . 2>/dev/null
+}
+
+
+_tfhow_compose_files() {
+    fd \
+        '^(docker-compose|compose)(\.[^.]+)?\.(yml|yaml)$' \
+        --exclude bin \
+        --exclude obj \
+        . 2>/dev/null
+}
+
+
+_tfhow_dockerfiles() {
+    fd \
+        '^(Dockerfile|Containerfile)(\..*)?$' \
+        --exclude bin \
+        --exclude obj \
+        . 2>/dev/null
+}
+
+
+_tfhow_connection_keys() {
+
+    {
+        _tfhow_rg -o \
+            'GetConnectionString\("[^"]+"' \
+            -g '*.cs' \
+            . 2>/dev/null |
+        sed \
+            's/.*GetConnectionString("//; s/"$//'
+
+        _tfhow_rg -o \
+            'Add(Npgsql|SqlServer|Sqlite)DbContext<[^>]+>\("[^"]+"' \
+            -g '*.cs' \
+            . 2>/dev/null |
+        sed \
+            's/.*>("//; s/"$//'
+
+        _tfhow_rg -o \
+            'ConnectionStrings__[A-Za-z0-9_.:-]+' \
+            -g '*.yml' \
+            -g '*.yaml' \
+            -g '*.env' \
+            -g '*.json' \
+            . 2>/dev/null |
+        sed 's/.*ConnectionStrings__//'
+
+    } |
+        sort -u
+}
+
+
+_tfhow_config_key_exists() {
+    local key="$1"
+
+    _tfhow_rg -q \
+        "\"${key}\"[[:space:]]*:" \
+        -g 'appsettings*.json' \
+        . 2>/dev/null
+}
+
+
+_tfhow_env_key_exists() {
+    local key="$1"
+
+    _tfhow_rg -q \
+        "ConnectionStrings__${key}|${key}=" \
+        -g '*.env' \
+        -g '*.yml' \
+        -g '*.yaml' \
+        . 2>/dev/null
+}
+
+
+_tfhow_has_user_secrets() {
+    _tfhow_rg -q \
+        '<UserSecretsId>[^<]+' \
+        -g '*.csproj' \
+        . 2>/dev/null
+}
+
+
+_tfhow_migration_count() {
+    fd \
+        -e cs \
+        . \
+        --exclude bin \
+        --exclude obj \
+        2>/dev/null |
+    rg '/Migrations/.*\.cs$' |
+    rg -v '\.Designer\.cs$|ModelSnapshot\.cs$' |
+    wc -l |
+    tr -d ' '
+}
+
+
+_tfhow_context_count() {
+    _tfhow_rg -l \
+        'class[[:space:]]+[A-Za-z_][A-Za-z0-9_]*.*:[[:space:]].*(DbContext|IdentityDbContext)' \
+        -g '*.cs' \
+        . 2>/dev/null |
+    wc -l |
+    tr -d ' '
+}
+
+
+_tfhow_has_auto_migrate() {
+    _tfhow_rg -q \
+        '\.Database\.Migrate(Async)?[[:space:]]*\(|MigrateDatabase|MigrateAsync[[:space:]]*\(' \
+        -g '*.cs' \
+        . 2>/dev/null
+}
+
+
+_tfhow_has_ensure_created() {
+    _tfhow_rg -q \
+        '\.Database\.EnsureCreated(Async)?[[:space:]]*\(' \
+        -g '*.cs' \
+        . 2>/dev/null
+}
+
+
+_tfhow_has_ensure_deleted() {
+    _tfhow_rg -q \
+        '\.Database\.EnsureDeleted(Async)?[[:space:]]*\(' \
+        -g '*.cs' \
+        . 2>/dev/null
+}
+
+
+_tfhow_detect_provider() {
+
+    if _tfhow_rg -q \
+        'UseNpgsql|AddNpgsqlDbContext|Npgsql.EntityFrameworkCore' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        . 2>/dev/null
+    then
+        printf 'PostgreSQL'
+        return
+    fi
+
+    if _tfhow_rg -q \
+        'UseSqlServer|AddSqlServerDbContext|Microsoft.EntityFrameworkCore.SqlServer' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        . 2>/dev/null
+    then
+        printf 'SQL Server'
+        return
+    fi
+
+    if _tfhow_rg -q \
+        'UseSqlite|AddSqliteDbContext|Microsoft.EntityFrameworkCore.Sqlite' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        . 2>/dev/null
+    then
+        printf 'SQLite'
+        return
+    fi
+
+    if _tfhow_rg -q \
+        'Pomelo.EntityFrameworkCore.MySql|UseMySql' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        . 2>/dev/null
+    then
+        printf 'MySQL/MariaDB'
+        return
+    fi
+
+    printf 'unknown'
+}
+
+
+_tfhow_has_redis() {
+    _tfhow_rg -q \
+        'StackExchange\.Redis|AddRedis|AddStackExchangeRedis|AddRedisDistributedCache|AddRedisClient' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        . 2>/dev/null
+}
+
+
+_tfhow_has_rabbit() {
+    _tfhow_rg -q \
+        'RabbitMQ|UsingRabbitMq|AddRabbitMQ|AddRabbitMq' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        . 2>/dev/null
+}
+
+
+_tfhow_has_kafka() {
+    _tfhow_rg -q \
+        'Confluent\.Kafka|AddKafka|UsingKafka' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        . 2>/dev/null
+}
+
+
+_tfhow_has_mongo() {
+    _tfhow_rg -q \
+        'MongoDB\.Driver|MongoClient' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        . 2>/dev/null
+}
+
+
+_tfhow_has_grpc() {
+    _tfhow_rg -q \
+        'AddGrpc|MapGrpcService|Grpc\.' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        . 2>/dev/null
+}
+
+
+_tfhow_has_auth() {
+    _tfhow_rg -q \
+        'AddAuthentication|AddAuthorization|IdentityServer|AddIdentity|AddMicrosoftIdentity' \
+        -g '*.cs' \
+        . 2>/dev/null
+}
+
+
+_tfhow_has_aspire() {
+    _tfhow_rg -q \
+        'Aspire\.Hosting|DistributedApplication\.CreateBuilder|AddProject<' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        . 2>/dev/null
+}
+
+
+_tfhow_has_https() {
+    _tfhow_rg -q \
+        'https://localhost|applicationUrl.*https|UseHttpsRedirection' \
+        -g '*.json' \
+        -g '*.cs' \
+        . 2>/dev/null
+}
+
+
+_tfhow_has_cert_refs() {
+    _tfhow_rg -q \
+        'Certificate|Certificates|Kestrel.*Https|\.pfx|\.pem|\.crt' \
+        -g '*.json' \
+        -g '*.cs' \
+        -g '*.yml' \
+        -g '*.yaml' \
+        . 2>/dev/null
+}
+
+
+_tfhow_package_manager() {
+
+    [[ -f pnpm-lock.yaml ]] && {
+        printf 'pnpm'
+        return
+    }
+
+    [[ -f yarn.lock ]] && {
+        printf 'yarn'
+        return
+    }
+
+    [[ -f bun.lockb || -f bun.lock ]] && {
+        printf 'bun'
+        return
+    }
+
+    [[ -f package-lock.json ]] && {
+        printf 'npm'
+        return
+    }
+
+    if fd \
+        '^pnpm-lock\.yaml$' \
+        --exclude node_modules \
+        . 2>/dev/null |
+        grep -q .
+    then
+        printf 'pnpm'
+        return
+    fi
+
+    if fd \
+        '^yarn\.lock$' \
+        --exclude node_modules \
+        . 2>/dev/null |
+        grep -q .
+    then
+        printf 'yarn'
+        return
+    fi
+
+    if fd \
+        '^package-lock\.json$' \
+        --exclude node_modules \
+        . 2>/dev/null |
+        grep -q .
+    then
+        printf 'npm'
+        return
+    fi
+
+    printf ''
+}
+
+
+_tfhow_has_frontend() {
+    fd \
+        '^package\.json$' \
+        --exclude node_modules \
+        . 2>/dev/null |
+        grep -q .
+}
+
+
+_tfhow_readme_run_evidence() {
+
+    _tfhow_rg -n \
+        -i \
+        '(dotnet run|docker compose|docker-compose|database update|dotnet ef|npm run|pnpm |yarn |bun |localhost|connection string|migration|user.?secrets)' \
+        -g 'README*' \
+        -g '*.md' \
+        . 2>/dev/null |
+    head -80
+}
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+tfhow() {
+
+    # Prevent zsh from printing redeclared local/typeset values.
+    setopt localoptions typesetsilent 2>/dev/null
+
+    local cmd="${1:-summary}"
+
+    [[ $# -gt 0 ]] && shift
+
+    _tf_need rg || return
+    _tf_need fd || return
+
+
+    case "$cmd" in
+
+
+    # ========================================================================
+    # SUMMARY
+    # ========================================================================
+
+    summary|overview|ov)
+
+        _tf_title "HOW TF DO I RUN THIS?"
+
+        local startup=""
+        local framework=""
+        local project_type=""
+        local provider=""
+        local migrations=0
+        local contexts=0
+        local compose_count=0
+        local dockerfile_count=0
+        local appsettings_count=0
+        local launch_count=0
+
+        startup="$(_tfhow_primary_startup)"
+
+        [[ -n "$startup" ]] && {
+            framework="$(_tfhow_framework "$startup")"
+            project_type="$(_tfhow_project_type "$startup")"
+        }
+
+        provider="$(_tfhow_detect_provider)"
+
+        migrations="$(_tfhow_migration_count)"
+        contexts="$(_tfhow_context_count)"
+
+        compose_count="$(
+            _tfhow_compose_files |
+            wc -l |
+            tr -d ' '
+        )"
+
+        dockerfile_count="$(
+            _tfhow_dockerfiles |
+            wc -l |
+            tr -d ' '
+        )"
+
+        appsettings_count="$(
+            _tfhow_appsettings |
+            wc -l |
+            tr -d ' '
+        )"
+
+        launch_count="$(
+            _tfhow_launchsettings |
+            wc -l |
+            tr -d ' '
+        )"
+
+
+        # --------------------------------------------------------------------
+        # APPLICATION
+        # --------------------------------------------------------------------
+
+        _tf_section "Application"
+
+        if [[ -n "$startup" ]]; then
+
+            _tf_label "startup candidate"
+            _tf_pathval "$startup"
+
+            _tf_label "type"
+            _tf_value "$project_type"
+
+            [[ -n "$framework" ]] && {
+                _tf_label "framework"
+                _tf_value "$framework"
+            }
+
+            if _tfhow_has_aspire; then
+                _tf_label "orchestration"
+                _tf_cfgval ".NET Aspire detected"
+            fi
+
+        else
+
+            _tf_warn "startup project" \
+                "could not confidently identify one"
+
+        fi
+
+
+        # --------------------------------------------------------------------
+        # CONFIGURATION
+        # --------------------------------------------------------------------
+
+        _tf_section "Configuration"
+
+        _tf_label "appsettings"
+        _tf_value "$appsettings_count"
+
+        _tf_label "launch settings"
+        _tf_value "$launch_count"
+
+        if _tfhow_has_user_secrets; then
+            _tf_label "user secrets"
+            _tf_cfgval "configured"
+        else
+            _tf_label "user secrets"
+            _tf_value "not detected"
+        fi
+
+
+        # --------------------------------------------------------------------
+        # DATABASE
+        # --------------------------------------------------------------------
+
+        _tf_section "Database"
+
+        _tf_label "provider"
+        _tf_dbval "$provider"
+
+        _tf_label "DbContexts"
+        _tf_value "$contexts"
+
+        _tf_label "migrations"
+        _tf_value "$migrations"
+
+
+        if _tfhow_has_auto_migrate; then
+
+            _tf_label "startup migration"
+            _tf_cfgval "Database.Migrate() detected"
+
+        else
+
+            _tf_label "startup migration"
+            _tf_value "none detected"
+
+        fi
+
+
+        if _tfhow_has_ensure_created; then
+
+            _tf_warn "EnsureCreated" \
+                "application may create schema itself"
+
+        fi
+
+
+        if _tfhow_has_ensure_deleted; then
+
+            _tf_bad "EnsureDeleted" \
+                "database deletion code exists"
+
+        fi
+
+
+        local keys=""
+        keys="$(_tfhow_connection_keys)"
+
+
+        if [[ -n "$keys" ]]; then
+
+            printf '\n'
+
+            while IFS= read -r key; do
+
+                [[ -z "$key" ]] && continue
+
+                _tf_label "connection"
+                _tf_cfgval "$key"
+
+            done <<< "$keys"
+
+        fi
+
+
+        # --------------------------------------------------------------------
+        # INFRASTRUCTURE
+        # --------------------------------------------------------------------
+
+        _tf_section "Infrastructure"
+
+        (( compose_count > 0 )) && {
+            _tf_label "Compose files"
+            _tf_value "$compose_count"
+        }
+
+        (( dockerfile_count > 0 )) && {
+            _tf_label "Dockerfiles"
+            _tf_value "$dockerfile_count"
+        }
+
+
+        _tfhow_has_redis &&
+            _tf_database "Redis"
+
+        _tfhow_has_rabbit &&
+            _tf_messaging "RabbitMQ"
+
+        _tfhow_has_kafka &&
+            _tf_messaging "Kafka"
+
+        _tfhow_has_mongo &&
+            _tf_database "MongoDB"
+
+        _tfhow_has_grpc &&
+            _tf_tech "gRPC"
+
+        _tfhow_has_auth &&
+            _tf_tech "authentication / authorization"
+
+
+        # --------------------------------------------------------------------
+        # FIRST-RUN RISKS
+        # --------------------------------------------------------------------
+
+        _tf_section "First-Run Risks"
+
+        local risk_count=0
+
+
+        if (( migrations > 0 )) &&
+           ! _tfhow_has_auto_migrate &&
+           ! _tfhow_has_ensure_created
+        then
+
+            _tfhow_medium \
+                "$migrations EF migrations exist but startup does not appear to apply them"
+
+            (( risk_count++ ))
+
+        fi
+
+
+        if _tfhow_has_user_secrets; then
+
+            _tfhow_low \
+                "UserSecretsId exists; required values may live outside Git"
+
+            (( risk_count++ ))
+
+        fi
+
+
+        if _tfhow_has_https; then
+
+            _tfhow_low \
+                "HTTPS detected; local development certificate may be required"
+
+            (( risk_count++ ))
+
+        fi
+
+
+        if _tfhow_has_cert_refs; then
+
+            _tfhow_medium \
+                "certificate-related configuration detected"
+
+            (( risk_count++ ))
+
+        fi
+
+
+        if [[ -n "$keys" ]]; then
+
+            while IFS= read -r key; do
+
+                [[ -z "$key" ]] && continue
+
+                if ! _tfhow_config_key_exists "$key" &&
+                   ! _tfhow_env_key_exists "$key"
+                then
+
+                    _tfhow_medium \
+                        "connection '$key' is referenced but not found in tracked config"
+
+                    (( risk_count++ ))
+
+                fi
+
+            done <<< "$keys"
+
+        fi
+
+
+        (( risk_count == 0 )) &&
+            _tfhow_fact \
+                "No obvious static startup blockers detected"
+
+
+        # --------------------------------------------------------------------
+        # LIKELY ORDER
+        # --------------------------------------------------------------------
+
+        _tf_section "Likely Startup Order"
+
+        local step=1
+
+
+        if (( compose_count > 0 )); then
+
+            _tfhow_step "$step" \
+                "Review/start required Compose infrastructure"
+
+            (( step++ ))
+
+        fi
+
+
+        if [[ -n "$keys" ]]; then
+
+            _tfhow_step "$step" \
+                "Resolve required connection strings"
+
+            (( step++ ))
+
+        fi
+
+
+        if (( migrations > 0 )); then
+
+            _tfhow_step "$step" \
+                "Verify database schema/migration state"
+
+            (( step++ ))
+
+        fi
+
+
+        if _tfhow_has_frontend; then
+
+            local pm=""
+            pm="$(_tfhow_package_manager)"
+
+            _tfhow_step "$step" \
+                "Verify frontend dependencies${pm:+ ($pm)}"
+
+            (( step++ ))
+
+        fi
+
+
+        if [[ -n "$startup" ]]; then
+
+            _tfhow_step "$step" \
+                "Run: dotnet run --project $startup"
+
+        else
+
+            _tfhow_step "$step" \
+                "Determine the intended startup project"
+
+        fi
+
+
+        printf '\n'
+        _tf_warn "READ ONLY" \
+            "nothing was started, migrated, connected to, or modified"
+
+        ;;
+
+
+    # ========================================================================
+    # STARTUP
+    # ========================================================================
+
+    startup|start)
+
+        _tf_title "STARTUP PROJECT ANALYSIS"
+
+        local candidates=""
+        candidates="$(_tfhow_startup_candidates)"
+
+
+        if [[ -z "$candidates" ]]; then
+
+            _tf_warn "startup" \
+                "no obvious startup project detected"
+
+            return
+
+        fi
+
+
+        _tf_section "Candidates"
+
+        local rank=0
+
+        while IFS='|' read -r score file reason; do
+
+            [[ -z "$file" ]] && continue
+
+            (( rank++ ))
+
+            _tfhow_header "$file"
+
+            _tf_label "rank"
+            _tf_value "$rank"
+
+            _tf_label "score"
+            _tf_value "$score"
+
+            _tf_label "type"
+            _tf_value "$(_tfhow_project_type "$file")"
+
+            local framework=""
+            framework="$(_tfhow_framework "$file")"
+
+            [[ -n "$framework" ]] && {
+                _tf_label "framework"
+                _tf_value "$framework"
+            }
+
+            _tf_label "evidence"
+            _tf_cfgval "$reason"
+
+        done <<< "$candidates"
+
+
+        # --------------------------------------------------------------------
+        # PROGRAM.CS
+        # --------------------------------------------------------------------
+
+        _tf_section "Startup Entry Points"
+
+        fd \
+            '^Program\.cs$' \
+            --exclude bin \
+            --exclude obj \
+            . 2>/dev/null |
+        while IFS= read -r file; do
+
+            _tf_path "$file"
+
+        done
+
+
+        # --------------------------------------------------------------------
+        # HOSTING STYLE
+        # --------------------------------------------------------------------
+
+        _tf_section "Hosting Evidence"
+
+        _tfhow_rg -n \
+            'WebApplication\.CreateBuilder|Host\.CreateDefaultBuilder|DistributedApplication\.CreateBuilder|CreateHostBuilder|app\.Run\(|host\.Run\(' \
+            -g '*.cs' \
+            . 2>/dev/null |
+        head -80
+
+        ;;
+
+
+    # ========================================================================
+    # BLOCKERS
+    # ========================================================================
+
+    blockers|blocker)
+
+        _tf_title "STARTUP BLOCKERS"
+
+        local high=0
+        local medium=0
+        local low=0
+
+        local startup=""
+        local migrations=0
+        local keys=""
+
+        startup="$(_tfhow_primary_startup)"
+        migrations="$(_tfhow_migration_count)"
+        keys="$(_tfhow_connection_keys)"
+
+
+        # --------------------------------------------------------------------
+        # HIGH
+        # --------------------------------------------------------------------
+
+        _tf_section "High Confidence"
+
+        if [[ -z "$startup" ]]; then
+
+            _tfhow_high \
+                "No startup project could be identified"
+
+            (( high++ ))
+
+        fi
+
+
+        if [[ -n "$keys" ]]; then
+
+            while IFS= read -r key; do
+
+                [[ -z "$key" ]] && continue
+
+                if ! _tfhow_config_key_exists "$key" &&
+                   ! _tfhow_env_key_exists "$key" &&
+                   ! _tfhow_has_user_secrets
+                then
+
+                    _tfhow_high \
+                        "connection string '$key' appears unresolved"
+
+                    (( high++ ))
+
+                fi
+
+            done <<< "$keys"
+
+        fi
+
+
+        (( high == 0 )) &&
+            _tfhow_fact \
+                "No high-confidence static blockers"
+
+
+        # --------------------------------------------------------------------
+        # MEDIUM
+        # --------------------------------------------------------------------
+
+        _tf_section "Needs Verification"
+
+        if (( migrations > 0 )) &&
+           ! _tfhow_has_auto_migrate &&
+           ! _tfhow_has_ensure_created
+        then
+
+            _tfhow_medium \
+                "$migrations migrations exist and no automatic migration call was found"
+
+            (( medium++ ))
+
+        fi
+
+
+        if _tfhow_has_cert_refs; then
+
+            _tfhow_medium \
+                "certificate configuration exists; verify local certificate availability"
+
+            (( medium++ ))
+
+        fi
+
+
+        if _tfhow_has_redis; then
+
+            _tfhow_medium \
+                "Redis is referenced; verify whether it must be running"
+
+            (( medium++ ))
+
+        fi
+
+
+        if _tfhow_has_rabbit; then
+
+            _tfhow_medium \
+                "RabbitMQ is referenced; verify whether it must be running"
+
+            (( medium++ ))
+
+        fi
+
+
+        if _tfhow_has_kafka; then
+
+            _tfhow_medium \
+                "Kafka is referenced; verify whether it must be running"
+
+            (( medium++ ))
+
+        fi
+
+
+        (( medium == 0 )) &&
+            _tfhow_fact \
+                "No obvious medium-confidence blockers"
+
+
+        # --------------------------------------------------------------------
+        # LOW
+        # --------------------------------------------------------------------
+
+        _tf_section "External / Hidden State"
+
+        if _tfhow_has_user_secrets; then
+
+            _tfhow_low \
+                "User Secrets are configured; Git cannot reveal their values"
+
+            (( low++ ))
+
+        fi
+
+
+        if _tfhow_has_https; then
+
+            _tfhow_low \
+                "HTTPS development configuration detected"
+
+            (( low++ ))
+
+        fi
+
+
+        if _tfhow_has_auth; then
+
+            _tfhow_low \
+                "authentication/authorization may depend on external identity configuration"
+
+            (( low++ ))
+
+        fi
+
+
+        (( low == 0 )) &&
+            _tfhow_fact \
+                "No obvious hidden-state dependencies"
+
+
+        _tf_section "Summary"
+
+        _tf_label "high"
+        _tf_value "$high"
+
+        _tf_label "verify"
+        _tf_value "$medium"
+
+        _tf_label "external"
+        _tf_value "$low"
+
+        printf '\n'
+        _tf_warn "Important" \
+            "these are static findings, not runtime health checks"
+
+        ;;
+
+
+    # ========================================================================
+    # CONFIG
+    # ========================================================================
+
+    config|configuration)
+
+        _tf_title "STARTUP CONFIGURATION"
+
+        _tf_section "Tracked Configuration Files"
+
+        local files=""
+        files="$(_tfhow_appsettings)"
+
+
+        if [[ -n "$files" ]]; then
+
+            while IFS= read -r file; do
+                _tf_path "$file"
+            done <<< "$files"
+
+        else
+
+            _tf_dim "No appsettings files found."
+
+        fi
+
+
+        _tf_section "Configuration Sources"
+
+        if _tfhow_rg -q \
+            'CreateDefaultBuilder|WebApplication\.CreateBuilder' \
+            -g '*.cs' \
+            . 2>/dev/null
+        then
+            _tfhow_fact \
+                "default .NET configuration pipeline detected"
+
+            printf '\n'
+            _tf_sub "1." "appsettings.json"
+            _tf_sub "2." "appsettings.{Environment}.json"
+            _tf_sub "3." "User Secrets in Development, when configured"
+            _tf_sub "4." "environment variables"
+            _tf_sub "5." "command-line arguments"
+        fi
+
+
+        _tf_section "Explicit Configuration Extensions"
+
+        local explicit=""
+
+        explicit="$(
+            _tfhow_rg -n \
+                'AddJsonFile|AddEnvironmentVariables|AddCommandLine|AddUserSecrets|AddIniFile|AddXmlFile|Configure<|GetSection\(' \
+                -g '*.cs' \
+                . 2>/dev/null |
+            head -100
+        )"
+
+        [[ -n "$explicit" ]] &&
+            printf '%s\n' "$explicit" ||
+            _tf_dim "No explicit additions detected."
+
+
+        _tf_section "Connection Strings"
+
+        local keys=""
+        keys="$(_tfhow_connection_keys)"
+
+        if [[ -n "$keys" ]]; then
+
+            while IFS= read -r key; do
+
+                [[ -z "$key" ]] && continue
+
+                _tf_label "key"
+                _tf_cfgval "$key"
+
+                if _tfhow_config_key_exists "$key"; then
+
+                    _tf_sub "tracked config" \
+                        "found"
+
+                elif _tfhow_env_key_exists "$key"; then
+
+                    _tf_sub "environment" \
+                        "reference found"
+
+                elif _tfhow_has_user_secrets; then
+
+                    _tf_sub "tracked config" \
+                        "not found; may be in User Secrets"
+
+                else
+
+                    _tf_sub "tracked config" \
+                        "NOT FOUND"
+
+                fi
+
+            done <<< "$keys"
+
+        else
+
+            _tf_dim "No GetConnectionString keys detected."
+
+        fi
+
+
+        _tf_section "Options / Sections"
+
+        _tfhow_rg -o \
+            'GetSection\("[^"]+"|Configuration\["[^"]+"|configuration\["[^"]+"' \
+            -g '*.cs' \
+            . 2>/dev/null |
+        sed \
+            -e 's/.*GetSection("//' \
+            -e 's/.*\["//' \
+            -e 's/"$//' |
+        sort -u |
+        head -100
+
+        ;;
+
+
+    # ========================================================================
+    # INFRA
+    # ========================================================================
+
+    infra|infrastructure)
+
+        _tf_title "REQUIRED INFRASTRUCTURE"
+
+        local found=0
+        local provider=""
+
+        provider="$(_tfhow_detect_provider)"
+
+
+        if [[ "$provider" != "unknown" ]]; then
+
+            _tf_section "Database"
+
+            _tf_database "$provider"
+
+            (( found++ ))
+
+        fi
+
+
+        if _tfhow_has_redis; then
+
+            _tf_section "Cache / Storage"
+            _tf_database "Redis"
+
+            (( found++ ))
+
+        fi
+
+
+        if _tfhow_has_mongo; then
+
+            _tf_section "Document Database"
+            _tf_database "MongoDB"
+
+            (( found++ ))
+
+        fi
+
+
+        if _tfhow_has_rabbit; then
+
+            _tf_section "Messaging"
+            _tf_messaging "RabbitMQ"
+
+            (( found++ ))
+
+        fi
+
+
+        if _tfhow_has_kafka; then
+
+            _tf_section "Messaging"
+            _tf_messaging "Kafka"
+
+            (( found++ ))
+
+        fi
+
+
+        if _tfhow_has_grpc; then
+
+            _tf_section "RPC"
+            _tf_tech "gRPC"
+
+            (( found++ ))
+
+        fi
+
+
+        if _tfhow_has_auth; then
+
+            _tf_section "Identity"
+            _tf_tech "Authentication / Authorization"
+
+            (( found++ ))
+
+        fi
+
+
+        if _tfhow_has_aspire; then
+
+            _tf_section "Orchestration"
+            _tf_framework ".NET Aspire"
+
+            (( found++ ))
+
+        fi
+
+
+        (( found == 0 )) &&
+            _tf_dim \
+                "No obvious infrastructure dependencies detected."
+
+
+        _tf_section "Evidence"
+
+        _tfhow_rg -n \
+            'UseNpgsql|UseSqlServer|UseSqlite|AddNpgsqlDbContext|AddSqlServerDbContext|StackExchange.Redis|RabbitMQ|UsingRabbitMq|Confluent.Kafka|MongoClient|AddGrpc|AddAuthentication|AddAuthorization|AddMicrosoftIdentity' \
+            -g '*.cs' \
+            -g '*.csproj' \
+            . 2>/dev/null |
+        head -120
+
+        ;;
+
+
+    # ========================================================================
+    # DB
+    # ========================================================================
+
+    db|database)
+
+        _tf_title "DATABASE STARTUP REQUIREMENTS"
+
+        local provider=""
+        local migrations=0
+        local contexts=0
+        local keys=""
+
+        provider="$(_tfhow_detect_provider)"
+        migrations="$(_tfhow_migration_count)"
+        contexts="$(_tfhow_context_count)"
+        keys="$(_tfhow_connection_keys)"
+
+
+        _tf_section "Database"
+
+        _tf_label "provider"
+        _tf_dbval "$provider"
+
+        _tf_label "contexts"
+        _tf_value "$contexts"
+
+        _tf_label "migrations"
+        _tf_value "$migrations"
+
+
+        _tf_section "Connection Requirements"
+
+        if [[ -n "$keys" ]]; then
+
+            while IFS= read -r key; do
+
+                [[ -z "$key" ]] && continue
+
+                _tfhow_header "$key"
+
+                if _tfhow_config_key_exists "$key"; then
+
+                    _tf_label "tracked config"
+                    _tf_ok "status" "found"
+
+                elif _tfhow_env_key_exists "$key"; then
+
+                    _tf_label "environment"
+                    _tf_ok "status" "reference found"
+
+                elif _tfhow_has_user_secrets; then
+
+                    _tf_label "resolution"
+                    _tf_warn "status" \
+                        "possibly User Secrets"
+
+                else
+
+                    _tf_label "resolution"
+                    _tf_bad "status" \
+                        "not found"
+
+                fi
+
+            done <<< "$keys"
+
+        else
+
+            _tf_dim "No named connection strings detected."
+
+        fi
+
+
+        _tf_section "Schema Initialization"
+
+        if _tfhow_has_auto_migrate; then
+
+            _tf_ok "Database.Migrate" \
+                "detected"
+
+        else
+
+            _tf_item "Database.Migrate" \
+                "not detected"
+
+        fi
+
+
+        if _tfhow_has_ensure_created; then
+
+            _tf_ok "EnsureCreated" \
+                "detected"
+
+        else
+
+            _tf_item "EnsureCreated" \
+                "not detected"
+
+        fi
+
+
+        if _tfhow_has_ensure_deleted; then
+
+            _tf_bad "EnsureDeleted" \
+                "detected"
+        fi
+
+
+        printf '\n'
+
+        if (( migrations > 0 )) &&
+           ! _tfhow_has_auto_migrate &&
+           ! _tfhow_has_ensure_created
+        then
+
+            _tf_warn "Conclusion" \
+                "database schema appears to be externally prepared"
+
+            _tf_dim \
+                "Do not assume 'dotnet ef database update' is safe."
+
+        fi
+
+        ;;
+
+
+    # ========================================================================
+    # MIGRATIONS
+    # ========================================================================
+
+    migrations|migration|mig)
+
+        _tf_title "MIGRATION STARTUP ANALYSIS"
+
+        local migrations=0
+        migrations="$(_tfhow_migration_count)"
+
+
+        _tf_section "Status"
+
+        _tf_label "migration files"
+        _tf_value "$migrations"
+
+
+        if _tfhow_has_auto_migrate; then
+
+            _tf_label "startup behavior"
+            _tf_cfgval "Database.Migrate() detected"
+
+        elif _tfhow_has_ensure_created; then
+
+            _tf_label "startup behavior"
+            _tf_cfgval "EnsureCreated() detected"
+
+        else
+
+            _tf_label "startup behavior"
+            _tf_value "no schema initialization detected"
+
+        fi
+
+
+        _tf_section "Migration Locations"
+
+        fd \
+            -t d \
+            '^Migrations$' \
+            --exclude bin \
+            --exclude obj \
+            . 2>/dev/null |
+        while IFS= read -r dir; do
+
+            local count=0
+
+            count="$(
+                fd \
+                    -e cs \
+                    . \
+                    "$dir" \
+                    2>/dev/null |
+                rg -v '\.Designer\.cs$|ModelSnapshot\.cs$' |
+                wc -l |
+                tr -d ' '
+            )"
+
+            _tf_label "$dir"
+            _tf_value "$count"
+
+        done
+
+
+        _tf_section "Automatic Migration Evidence"
+
+        local evidence=""
+
+        evidence="$(
+            _tfhow_rg -n \
+                '\.Database\.Migrate(Async)?[[:space:]]*\(|EnsureCreated(Async)?[[:space:]]*\(|EnsureDeleted(Async)?[[:space:]]*\(' \
+                -g '*.cs' \
+                . 2>/dev/null |
+            head -100
+        )"
+
+
+        [[ -n "$evidence" ]] &&
+            printf '%s\n' "$evidence" ||
+            _tf_dim "No automatic migration/schema calls found."
+
+
+        _tf_section "Documentation Evidence"
+
+        local docs=""
+
+        docs="$(
+            _tfhow_rg -n \
+                -i \
+                'dotnet ef database update|database migration|apply migrations|run migrations|migration' \
+                -g 'README*' \
+                -g '*.md' \
+                . 2>/dev/null |
+            head -80
+        )"
+
+
+        [[ -n "$docs" ]] &&
+            printf '%s\n' "$docs" ||
+            _tf_dim "No migration instructions found in documentation."
+
+
+        printf '\n'
+        _tf_warn "READ ONLY" \
+            "tfhow never applies migrations"
+
+        ;;
+
+
+    # ========================================================================
+    # DOCKER
+    # ========================================================================
+
+    docker|containers)
+
+        _tf_title "CONTAINER / COMPOSE ANALYSIS"
+
+        _tf_section "Compose Files"
+
+        local compose=""
+        compose="$(_tfhow_compose_files)"
+
+
+        if [[ -n "$compose" ]]; then
+
+            while IFS= read -r file; do
+
+                _tf_path "$file"
+
+                if command -v yq >/dev/null 2>&1; then
+
+                    local services=""
+
+                    services="$(
+                        yq \
+                            '.services | keys | .[]' \
+                            "$file" \
+                            2>/dev/null
+                    )"
+
+                    if [[ -n "$services" ]]; then
+
+                        while IFS= read -r service; do
+                            _tf_sub "service" "$service"
+                        done <<< "$services"
+
+                    fi
+
+                fi
+
+            done <<< "$compose"
+
+        else
+
+            _tf_dim "No Compose files detected."
+
+        fi
+
+
+        _tf_section "Dockerfiles / Containerfiles"
+
+        local dockerfiles=""
+        dockerfiles="$(_tfhow_dockerfiles)"
+
+
+        if [[ -n "$dockerfiles" ]]; then
+
+            while IFS= read -r file; do
+                _tf_path "$file"
+            done <<< "$dockerfiles"
+
+        else
+
+            _tf_dim "No Dockerfile/Containerfile detected."
+
+        fi
+
+
+        _tf_section "Container Images"
+
+        _tfhow_rg \
+            '^[[:space:]]*image:[[:space:]]*' \
+            -g '*.yml' \
+            -g '*.yaml' \
+            . 2>/dev/null |
+        sed \
+            's/^[^:]*://' |
+        sed \
+            's/^[[:space:]]*//' |
+        sort -u |
+        head -100
+
+
+        _tf_section "Compose Dependencies"
+
+        _tfhow_rg -n \
+            'depends_on:|healthcheck:|condition:[[:space:]]*service_' \
+            -g '*.yml' \
+            -g '*.yaml' \
+            . 2>/dev/null |
+        head -100
+
+
+        printf '\n'
+        _tf_warn "READ ONLY" \
+            "Docker/Podman was not started or queried"
+
+        ;;
+
+
+    # ========================================================================
+    # SECRETS
+    # ========================================================================
+
+    secrets|secret)
+
+        _tf_title "SECRET / EXTERNAL CONFIG ANALYSIS"
+
+        _tf_section ".NET User Secrets"
+
+        local secret_ids=""
+
+        secret_ids="$(
+            _tfhow_rg -o \
+                '<UserSecretsId>[^<]+' \
+                -g '*.csproj' \
+                . 2>/dev/null |
+            sed 's/.*<UserSecretsId>//' |
+            sort -u
+        )"
+
+
+        if [[ -n "$secret_ids" ]]; then
+
+            while IFS= read -r id; do
+
+                _tf_label "UserSecretsId"
+                _tf_cfgval "$id"
+
+            done <<< "$secret_ids"
+
+        else
+
+            _tf_dim "No UserSecretsId detected."
+
+        fi
+
+
+        _tf_section "Secret-Like Configuration References"
+
+        _tfhow_rg -n \
+            -i \
+            '(password|passwd|secret|apikey|api_key|clientsecret|token|certificate|thumbprint)' \
+            -g '*.cs' \
+            -g '*.json' \
+            -g '*.yml' \
+            -g '*.yaml' \
+            -g '*.config' \
+            -g '*.xml' \
+            --glob '!**/bin/**' \
+            --glob '!**/obj/**' \
+            . 2>/dev/null |
+        sed -E \
+            's/("(password|passwd|secret|apikey|api_key|clientsecret|token)"[[:space:]]*:[[:space:]]*")[^"]+/\1<redacted>/Ig' |
+        head -120
+
+
+        _tf_section "Environment Files"
+
+        local envfiles=""
+
+        envfiles="$(
+            fd \
+                -t f \
+                '^\.env(\..*)?$' \
+                --exclude node_modules \
+                . 2>/dev/null
+        )"
+
+
+        if [[ -n "$envfiles" ]]; then
+
+            while IFS= read -r file; do
+                _tf_path "$file"
+            done <<< "$envfiles"
+
+        else
+
+            _tf_dim "No .env files detected."
+
+        fi
+
+
+        printf '\n'
+        _tf_warn "Safety" \
+            "values from User Secrets are not read"
+
+        ;;
+
+
+    # ========================================================================
+    # PORTS
+    # ========================================================================
+
+    ports|port)
+
+        _tf_title "PORT / URL MAP"
+
+
+        _tf_section "Launch Settings"
+
+        local launchfiles=""
+        launchfiles="$(_tfhow_launchsettings)"
+
+
+        if [[ -n "$launchfiles" ]]; then
+
+            while IFS= read -r file; do
+
+                _tf_path "$file"
+
+                if command -v jq >/dev/null 2>&1; then
+
+                    jq -r \
+                        '.profiles // {} |
+                         to_entries[] |
+                         select(.value.applicationUrl != null) |
+                         "\(.key)|\(.value.applicationUrl)"' \
+                        "$file" \
+                        2>/dev/null |
+                    while IFS='|' read -r profile url; do
+
+                        _tf_label "$profile"
+                        _tf_cfgval "$url"
+
+                    done
+
+                else
+
+                    _tfhow_rg -n \
+                        'applicationUrl' \
+                        "$file" \
+                        2>/dev/null
+
+                fi
+
+            done <<< "$launchfiles"
+
+        else
+
+            _tf_dim "No launchSettings.json detected."
+
+        fi
+
+
+        _tf_section "Compose Ports"
+
+        _tfhow_rg -n \
+            '^[[:space:]]*-[[:space:]]*["'\'']?[0-9]+:[0-9]+' \
+            -g '*.yml' \
+            -g '*.yaml' \
+            . 2>/dev/null |
+        head -100
+
+
+        _tf_section "URLs in Configuration"
+
+        _tfhow_rg -o \
+            'https?://[^"'\'', }<]+' \
+            -g '*.json' \
+            -g '*.cs' \
+            -g '*.config' \
+            -g '*.xml' \
+            -g '*.yml' \
+            -g '*.yaml' \
+            . 2>/dev/null |
+        sort -u |
+        head -120
+
+        ;;
+
+
+    # ========================================================================
+    # ENV
+    # ========================================================================
+
+    env|environment)
+
+        _tf_title "ENVIRONMENT REQUIREMENTS"
+
+
+        _tf_section "ASP.NET Environment"
+
+        _tfhow_rg -n \
+            'ASPNETCORE_ENVIRONMENT|DOTNET_ENVIRONMENT|IsDevelopment\(|IsProduction\(|IsEnvironment\(' \
+            -g '*.cs' \
+            -g '*.json' \
+            -g '*.yml' \
+            -g '*.yaml' \
+            . 2>/dev/null |
+        head -100
+
+
+        _tf_section "Environment Variable Reads"
+
+        {
+            _tfhow_rg -o \
+                'Environment\.GetEnvironmentVariable\("[^"]+"' \
+                -g '*.cs' \
+                . 2>/dev/null |
+            sed \
+                's/.*GetEnvironmentVariable("//; s/"$//'
+
+            _tfhow_rg -o \
+                'ConnectionStrings__[A-Za-z0-9_.:-]+' \
+                -g '*.yml' \
+                -g '*.yaml' \
+                -g '*.env' \
+                . 2>/dev/null
+
+        } |
+        sort -u |
+        head -150
+
+
+        _tf_section "Environment Files"
+
+        fd \
+            -t f \
+            '^\.env(\..*)?$' \
+            --exclude node_modules \
+            . 2>/dev/null |
+        while IFS= read -r file; do
+            _tf_path "$file"
+        done
+
+        ;;
+
+
+    # ========================================================================
+    # ORDER
+    # ========================================================================
+
+    order|sequence)
+
+        _tf_title "LIKELY STARTUP SEQUENCE"
+
+        local startup=""
+        local migrations=0
+        local compose=""
+        local keys=""
+        local step=1
+
+        startup="$(_tfhow_primary_startup)"
+        migrations="$(_tfhow_migration_count)"
+        compose="$(_tfhow_compose_files)"
+        keys="$(_tfhow_connection_keys)"
+
+
+        if [[ -n "$compose" ]]; then
+
+            _tfhow_step "$step" \
+                "Review required infrastructure"
+
+            while IFS= read -r file; do
+                _tf_sub "compose" "$file"
+            done <<< "$compose"
+
+            (( step++ ))
+
+        fi
+
+
+        if [[ -n "$keys" ]]; then
+
+            _tfhow_step "$step" \
+                "Resolve database connection strings"
+
+            while IFS= read -r key; do
+                _tf_sub "connection" "$key"
+            done <<< "$keys"
+
+            (( step++ ))
+
+        fi
+
+
+        if _tfhow_has_user_secrets; then
+
+            _tfhow_step "$step" \
+                "Verify required User Secrets"
+
+            (( step++ ))
+
+        fi
+
+
+        if (( migrations > 0 )); then
+
+            _tfhow_step "$step" \
+                "Verify database schema"
+
+            if _tfhow_has_auto_migrate; then
+
+                _tf_sub "behavior" \
+                    "application appears to migrate automatically"
+
+            else
+
+                _tf_sub "behavior" \
+                    "application does NOT appear to migrate automatically"
+
+                _tf_sub "warning" \
+                    "do not apply migrations until team workflow is known"
+
+            fi
+
+            (( step++ ))
+
+        fi
+
+
+        if _tfhow_has_frontend; then
+
+            local pm=""
+            pm="$(_tfhow_package_manager)"
+
+            _tfhow_step "$step" \
+                "Verify frontend dependencies"
+
+            [[ -n "$pm" ]] &&
+                _tf_sub "package manager" "$pm"
+
+            (( step++ ))
+
+        fi
+
+
+        if _tfhow_has_https; then
+
+            _tfhow_step "$step" \
+                "Verify HTTPS/development certificate"
+
+            (( step++ ))
+
+        fi
+
+
+        if [[ -n "$startup" ]]; then
+
+            _tfhow_step "$step" \
+                "Run application"
+
+            _tf_sub "command" \
+                "dotnet run --project $startup"
+
+        else
+
+            _tfhow_step "$step" \
+                "Determine startup project"
+
+        fi
+
+
+        printf '\n'
+        _tf_warn "Not executed" \
+            "this is an inferred sequence only"
+
+        ;;
+
+
+    # ========================================================================
+    # EVIDENCE
+    # ========================================================================
+
+    evidence|ev)
+
+        _tf_title "STARTUP EVIDENCE"
+
+        _tf_section "Documentation"
+
+        local docs=""
+        docs="$(_tfhow_readme_run_evidence)"
+
+        [[ -n "$docs" ]] &&
+            printf '%s\n' "$docs" ||
+            _tf_dim "No useful README startup evidence found."
+
+
+        _tf_section "Program / Host"
+
+        _tfhow_rg -n \
+            'CreateBuilder|CreateHostBuilder|AddDbContext|AddNpgsqlDbContext|AddSqlServerDbContext|AddRedis|AddStackExchangeRedis|AddAuthentication|AddAuthorization|AddGrpc|MapGrpcService|app\.Run\(' \
+            -g '*.cs' \
+            . 2>/dev/null |
+        head -150
+
+
+        _tf_section "Configuration"
+
+        _tfhow_rg -n \
+            'GetConnectionString|GetSection|AddJsonFile|AddEnvironmentVariables|GetEnvironmentVariable|UserSecretsId' \
+            -g '*.cs' \
+            -g '*.csproj' \
+            . 2>/dev/null |
+        head -150
+
+
+        _tf_section "Database Initialization"
+
+        _tfhow_rg -n \
+            'Database\.Migrate|EnsureCreated|EnsureDeleted|dotnet ef database update' \
+            -g '*.cs' \
+            -g '*.md' \
+            . 2>/dev/null |
+        head -100
+
+        ;;
+
+
+    # ========================================================================
+    # WHY
+    # ========================================================================
+
+    why)
+
+        local thing="$1"
+
+        [[ -z "$thing" ]] && {
+            echo "Usage: tfhow why <thing>"
+            return 1
+        }
+
+
+        _tf_title "WHY: $thing"
+
+        _tf_section "Source Evidence"
+
+        local hits=""
+
+        hits="$(
+            _tfhow_rg -n \
+                -i \
+                -- "$thing" \
+                -g '*.cs' \
+                -g '*.csproj' \
+                -g '*.json' \
+                -g '*.config' \
+                -g '*.xml' \
+                -g '*.props' \
+                -g '*.targets' \
+                -g '*.yml' \
+                -g '*.yaml' \
+                -g '*.env' \
+                -g '*.md' \
+                . 2>/dev/null |
+            head -150
+        )"
+
+
+        if [[ -n "$hits" ]]; then
+
+            printf '%s\n' "$hits"
+
+        else
+
+            _tf_warn "evidence" "no matches"
+            return
+
+        fi
+
+
+        _tf_section "Interpretation"
+
+
+        if _tfhow_rg -q \
+            "GetConnectionString\\(\"$thing\"" \
+            -g '*.cs' \
+            . 2>/dev/null
+        then
+
+            _tf_database \
+                "'$thing' is consumed as a connection string"
+
+        fi
+
+
+        if _tfhow_rg -q \
+            "GetSection\\(\"$thing\"" \
+            -g '*.cs' \
+            . 2>/dev/null
+        then
+
+            _tf_tech \
+                "'$thing' is consumed as a configuration section"
+
+        fi
+
+
+        if _tfhow_rg -q \
+            "<ProjectReference[^>]+$thing" \
+            -g '*.csproj' \
+            . 2>/dev/null
+        then
+
+            _tf_tech \
+                "'$thing' participates in project dependencies"
+
+        fi
+
+
+        if _tfhow_rg -q \
+            "$thing" \
+            -g 'docker-compose*.yml' \
+            -g 'docker-compose*.yaml' \
+            -g 'compose*.yml' \
+            -g 'compose*.yaml' \
+            . 2>/dev/null
+        then
+
+            _tf_tech \
+                "'$thing' appears in container orchestration"
+
+        fi
+
+
+        if _tfhow_rg -q \
+            "$thing" \
+            -g '*Migrations/*.cs' \
+            . 2>/dev/null
+        then
+
+            _tf_database \
+                "'$thing' appears in EF migration history"
+
+        fi
+
+        ;;
+
+
+    # ========================================================================
+    # HELP
+    # ========================================================================
+
+    help|-h|--help)
+
+        cat <<'EOF'
+
+tfhow - deterministic startup archaeology
+
+  tfhow
+      Answer "how TF do I run this?"
+
+  tfhow startup
+      Identify and rank likely startup projects.
+
+  tfhow blockers
+      Show likely startup blockers and unknowns.
+
+  tfhow config
+      Explain configuration sources and required keys.
+
+  tfhow infra
+      Detect databases, Redis, RabbitMQ, Kafka, gRPC, auth, etc.
+
+  tfhow db
+      Database startup requirements.
+
+  tfhow migrations
+      Determine how schema initialization appears to work.
+
+  tfhow docker
+      Inspect Compose/Docker/Containerfile infrastructure.
+
+  tfhow secrets
+      Find secret dependencies without reading User Secret values.
+
+  tfhow ports
+      Map launch URLs, ports and configured URLs.
+
+  tfhow env
+      Find environment-dependent behavior and variable reads.
+
+  tfhow order
+      Produce the likely first-run sequence.
+
+  tfhow evidence
+      Show the raw evidence behind startup inference.
+
+  tfhow why THING
+      Explain why a particular service/config/key/file matters.
+
+
+SAFETY
+
+  tfhow is intentionally read-only.
+
+  It DOES NOT:
+
+      run dotnet
+      start containers
+      contact databases
+      apply migrations
+      delete databases
+      modify configuration
+      read User Secret values
+
+
+PHILOSOPHY
+
+  FACT:
+      "17 migrations exist"
+
+  FACT:
+      "Database.Migrate() was not found"
+
+  INFERENCE:
+      "database schema appears externally prepared"
+
+  NOT ASSUMED:
+      "you should run dotnet ef database update"
+
+EOF
+
+        ;;
+
+
+    # ========================================================================
+    # UNKNOWN
+    # ========================================================================
+
+    *)
+
+        echo "tfhow: unknown command: $cmd"
+        echo
+        echo "Run:"
+        echo "  tfhow help"
+
+        return 1
+
+        ;;
+
+    esac
+}
