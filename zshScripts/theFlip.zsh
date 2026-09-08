@@ -3563,7 +3563,689 @@ EOF
 # ----------------------------------------------------------------------------
 # INTERNAL HELPERS
 # ----------------------------------------------------------------------------
+# ============================================================================
+# MULTI-PROJECT / SCOPE HELPERS
+# ============================================================================
 
+_tfhow_project_name() {
+    basename "$1" .csproj
+}
+
+
+_tfhow_project_dir() {
+    dirname "$1"
+}
+
+
+_tfhow_is_test_project() {
+    local project="$1"
+
+    [[ "$project" == *Tests.csproj ||
+       "$project" == *Test.csproj ||
+       "$project" == */tests/* ||
+       "$project" == */test/* ]] && return 0
+
+    _tfhow_rg -q \
+        '<IsTestProject>[[:space:]]*true[[:space:]]*</IsTestProject>|Microsoft\.NET\.Test\.Sdk|xunit|NUnit|MSTest' \
+        "$project" 2>/dev/null
+}
+
+
+_tfhow_is_apphost() {
+    local project="$1"
+
+    [[ "$project" == *AppHost*.csproj ]] && return 0
+
+    _tfhow_rg -q \
+        'Aspire\.Hosting\.AppHost|DistributedApplication\.CreateBuilder' \
+        "$project" "$(dirname "$project")" \
+        2>/dev/null
+}
+
+
+_tfhow_is_web_project() {
+    local project="$1"
+
+    _tfhow_rg -q \
+        '<Project[[:space:]][^>]*Sdk="Microsoft\.NET\.Sdk\.Web"' \
+        "$project" 2>/dev/null
+}
+
+
+_tfhow_is_executable_project() {
+    local project="$1"
+    local dir=""
+
+    dir="$(dirname "$project")"
+
+    _tfhow_is_test_project "$project" && return 1
+
+    _tfhow_is_apphost "$project" && return 0
+
+    _tfhow_is_web_project "$project" && return 0
+
+    _tfhow_rg -q \
+        '<OutputType>[[:space:]]*(Exe|WinExe)[[:space:]]*</OutputType>' \
+        "$project" 2>/dev/null &&
+        return 0
+
+    [[ -f "$dir/Program.cs" ]] && return 0
+
+    return 1
+}
+
+
+_tfhow_project_role() {
+    local project="$1"
+
+    if _tfhow_is_test_project "$project"; then
+        printf 'TEST'
+    elif _tfhow_is_apphost "$project"; then
+        printf 'ORCHESTRATOR'
+    elif _tfhow_is_web_project "$project"; then
+        printf 'WEB'
+    elif _tfhow_is_executable_project "$project"; then
+        printf 'EXECUTABLE'
+    else
+        printf 'LIBRARY'
+    fi
+}
+
+
+_tfhow_runnable_projects() {
+    local project=""
+
+    while IFS= read -r project; do
+        [[ -z "$project" ]] && continue
+
+        if _tfhow_is_executable_project "$project"; then
+            printf '%s\n' "$project"
+        fi
+
+    done < <(_tfhow_csprojects)
+}
+
+
+_tfhow_library_projects() {
+    local project=""
+
+    while IFS= read -r project; do
+        [[ -z "$project" ]] && continue
+
+        if ! _tfhow_is_executable_project "$project" &&
+           ! _tfhow_is_test_project "$project"
+        then
+            printf '%s\n' "$project"
+        fi
+
+    done < <(_tfhow_csprojects)
+}
+
+
+_tfhow_test_projects() {
+    local project=""
+
+    while IFS= read -r project; do
+        [[ -z "$project" ]] && continue
+
+        if _tfhow_is_test_project "$project"; then
+            printf '%s\n' "$project"
+        fi
+
+    done < <(_tfhow_csprojects)
+}
+
+
+_tfhow_apphosts() {
+    local project=""
+
+    while IFS= read -r project; do
+        [[ -z "$project" ]] && continue
+
+        if _tfhow_is_apphost "$project"; then
+            printf '%s\n' "$project"
+        fi
+
+    done < <(_tfhow_csprojects)
+}
+
+
+_tfhow_resolve_project() {
+    local query="$1"
+    local project=""
+    local matches=()
+
+    [[ -z "$query" ]] && return 1
+
+    # Exact path
+    if [[ -f "$query" && "$query" == *.csproj ]]; then
+        printf '%s\n' "$query"
+        return 0
+    fi
+
+    # ./relative/path
+    if [[ -f "./$query" && "$query" == *.csproj ]]; then
+        printf '%s\n' "./$query"
+        return 0
+    fi
+
+    # Search by project name/path
+    while IFS= read -r project; do
+        [[ -z "$project" ]] && continue
+
+        local name=""
+        name="$(_tfhow_project_name "$project")"
+
+        if [[ "${name:l}" == "${query:l}" ||
+              "${project:l}" == *"${query:l}"* ]]
+        then
+            matches+=("$project")
+        fi
+
+    done < <(_tfhow_csprojects)
+
+    if (( ${#matches[@]} == 1 )); then
+        printf '%s\n' "${matches[1]}"
+        return 0
+    fi
+
+    if (( ${#matches[@]} > 1 )); then
+        printf 'AMBIGUOUS\n'
+
+        for project in "${matches[@]}"; do
+            printf '%s\n' "$project"
+        done
+
+        return 2
+    fi
+
+    return 1
+}
+
+
+_tfhow_scope_rg() {
+    local project="$1"
+    shift
+
+    local dir=""
+    dir="$(_tfhow_project_dir "$project")"
+
+    rg \
+        --glob '!**/bin/**' \
+        --glob '!**/obj/**' \
+        --glob '!**/node_modules/**' \
+        --glob '!**/.git/**' \
+        "$@" \
+        "$dir"
+}
+
+
+_tfhow_project_connection_keys() {
+    local project="$1"
+
+    {
+        _tfhow_scope_rg "$project" \
+            -o \
+            'GetConnectionString\("[^"]+"' \
+            -g '*.cs' \
+            2>/dev/null |
+        sed \
+            's/.*GetConnectionString("//; s/"$//'
+
+        _tfhow_scope_rg "$project" \
+            -o \
+            'Add(Npgsql|SqlServer|Sqlite)DbContext<[^>]+>\("[^"]+"' \
+            -g '*.cs' \
+            2>/dev/null |
+        sed \
+            's/.*>("//; s/"$//'
+
+    } |
+        sort -u
+}
+
+
+_tfhow_project_migration_count() {
+    local project="$1"
+    local dir=""
+
+    dir="$(_tfhow_project_dir "$project")"
+
+    fd \
+        -e cs \
+        . \
+        "$dir" \
+        --exclude bin \
+        --exclude obj \
+        2>/dev/null |
+    rg '/Migrations/.*\.cs$' |
+    rg -v '\.Designer\.cs$|ModelSnapshot\.cs$' |
+    wc -l |
+    tr -d ' '
+}
+
+
+_tfhow_project_has_auto_migrate() {
+    local project="$1"
+
+    _tfhow_scope_rg "$project" \
+        -q \
+        '\.Database\.Migrate(Async)?[[:space:]]*\(|MigrateDatabase|MigrateAsync[[:space:]]*\(' \
+        -g '*.cs' \
+        2>/dev/null
+}
+
+
+_tfhow_project_has_ensure_created() {
+    local project="$1"
+
+    _tfhow_scope_rg "$project" \
+        -q \
+        '\.Database\.EnsureCreated(Async)?[[:space:]]*\(' \
+        -g '*.cs' \
+        2>/dev/null
+}
+
+
+_tfhow_project_has_redis() {
+    local project="$1"
+
+    _tfhow_scope_rg "$project" \
+        -q \
+        'StackExchange\.Redis|AddRedis|AddStackExchangeRedis|AddRedisDistributedCache|AddRedisClient' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        2>/dev/null
+}
+
+
+_tfhow_project_has_rabbit() {
+    local project="$1"
+
+    _tfhow_scope_rg "$project" \
+        -q \
+        'RabbitMQ|UsingRabbitMq|AddRabbitMQ|AddRabbitMq' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        2>/dev/null
+}
+
+
+_tfhow_project_has_kafka() {
+    local project="$1"
+
+    _tfhow_scope_rg "$project" \
+        -q \
+        'Confluent\.Kafka|AddKafka|UsingKafka' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        2>/dev/null
+}
+
+
+_tfhow_project_has_grpc() {
+    local project="$1"
+
+    _tfhow_scope_rg "$project" \
+        -q \
+        'AddGrpc|MapGrpcService|Grpc\.' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        2>/dev/null
+}
+
+
+_tfhow_project_has_auth() {
+    local project="$1"
+
+    _tfhow_scope_rg "$project" \
+        -q \
+        'AddAuthentication|AddAuthorization|IdentityServer|AddIdentity|AddMicrosoftIdentity' \
+        -g '*.cs' \
+        2>/dev/null
+}
+
+
+_tfhow_project_provider() {
+    local project="$1"
+
+    if _tfhow_scope_rg "$project" \
+        -q \
+        'UseNpgsql|AddNpgsqlDbContext|Npgsql.EntityFrameworkCore' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        2>/dev/null
+    then
+        printf 'PostgreSQL'
+        return
+    fi
+
+    if _tfhow_scope_rg "$project" \
+        -q \
+        'UseSqlServer|AddSqlServerDbContext|Microsoft.EntityFrameworkCore.SqlServer' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        2>/dev/null
+    then
+        printf 'SQL Server'
+        return
+    fi
+
+    if _tfhow_scope_rg "$project" \
+        -q \
+        'UseSqlite|AddSqliteDbContext|Microsoft.EntityFrameworkCore.Sqlite' \
+        -g '*.cs' \
+        -g '*.csproj' \
+        2>/dev/null
+    then
+        printf 'SQLite'
+        return
+    fi
+
+    printf 'none detected'
+}
+
+
+_tfhow_project_launchsettings() {
+    local project="$1"
+    local dir=""
+
+    dir="$(_tfhow_project_dir "$project")"
+
+    if [[ -f "$dir/Properties/launchSettings.json" ]]; then
+        printf '%s\n' "$dir/Properties/launchSettings.json"
+    fi
+}
+
+
+_tfhow_project_urls() {
+    local project="$1"
+    local launch=""
+
+    launch="$(_tfhow_project_launchsettings "$project")"
+
+    [[ -z "$launch" ]] && return
+
+    if command -v jq >/dev/null 2>&1; then
+        jq -r \
+            '.profiles // {} |
+             to_entries[] |
+             select(.value.applicationUrl != null) |
+             .value.applicationUrl' \
+            "$launch" \
+            2>/dev/null
+    else
+        rg \
+            -o \
+            'https?://[^"; ]+' \
+            "$launch" \
+            2>/dev/null |
+        sort -u
+    fi
+}
+
+
+_tfhow_project_refs() {
+    local project="$1"
+    local basedir=""
+
+    basedir="$(dirname "$project")"
+
+    # Extract Include paths. We intentionally don't resolve/canonicalize them
+    # here because displaying the declared dependency is useful evidence.
+    sed -n \
+        's/.*<ProjectReference[^>]*Include="\([^"]*\)".*/\1/p' \
+        "$project" \
+        2>/dev/null
+}
+
+
+_tfhow_reverse_refs() {
+    local target="$1"
+    local target_name=""
+    local project=""
+
+    target_name="$(basename "$target")"
+
+    while IFS= read -r project; do
+        [[ -z "$project" ]] && continue
+
+        if rg -q \
+            "<ProjectReference[^>]*Include=\"[^\"]*${target_name}\"" \
+            "$project" \
+            2>/dev/null
+        then
+            printf '%s\n' "$project"
+        fi
+
+    done < <(_tfhow_csprojects)
+}
+
+
+_tfhow_apphost_children() {
+    local apphost="$1"
+    local dir=""
+
+    dir="$(_tfhow_project_dir "$apphost")"
+
+    # Aspire generated extension calls generally look like:
+    # builder.AddProject<Projects.Some_Project>("name")
+    #
+    # This provides orchestration evidence even when mapping generated
+    # Projects.* symbols back to csproj paths is imperfect.
+    _tfhow_scope_rg "$apphost" \
+        -o \
+        'AddProject<Projects\.[A-Za-z0-9_]+' \
+        -g '*.cs' \
+        2>/dev/null |
+    sed \
+        's/.*AddProject<Projects\.//' |
+    sort -u
+}
+
+
+_tfhow_print_project_summary() {
+    local project="$1"
+
+    local name=""
+    local role=""
+    local framework=""
+    local provider=""
+    local migrations=0
+    local keys=""
+    local urls=""
+
+    name="$(_tfhow_project_name "$project")"
+    role="$(_tfhow_project_role "$project")"
+    framework="$(_tfhow_framework "$project")"
+    provider="$(_tfhow_project_provider "$project")"
+    migrations="$(_tfhow_project_migration_count "$project")"
+    keys="$(_tfhow_project_connection_keys "$project")"
+    urls="$(_tfhow_project_urls "$project")"
+
+    _tfhow_header "$name"
+
+    _tf_label "project"
+    _tf_pathval "$project"
+
+    _tf_label "role"
+    _tf_value "$role"
+
+    [[ -n "$framework" ]] && {
+        _tf_label "framework"
+        _tf_value "$framework"
+    }
+
+    if [[ "$role" != "LIBRARY" && "$role" != "TEST" ]]; then
+        _tf_label "run"
+        _tf_cfgval "dotnet run --project $project"
+    fi
+
+    if [[ "$provider" != "none detected" ]]; then
+        _tf_label "database"
+        _tf_dbval "$provider"
+    fi
+
+    if (( migrations > 0 )); then
+        _tf_label "migrations"
+        _tf_value "$migrations"
+
+        if _tfhow_project_has_auto_migrate "$project"; then
+            _tf_sub "schema" "startup migration detected"
+        elif _tfhow_project_has_ensure_created "$project"; then
+            _tf_sub "schema" "EnsureCreated detected"
+        else
+            _tf_sub "schema" "appears externally prepared"
+        fi
+    fi
+
+    if [[ -n "$keys" ]]; then
+        while IFS= read -r key; do
+            [[ -z "$key" ]] && continue
+            _tf_sub "connection" "$key"
+        done <<< "$keys"
+    fi
+
+    _tfhow_project_has_redis "$project" &&
+        _tf_sub "requires?" "Redis"
+
+    _tfhow_project_has_rabbit "$project" &&
+        _tf_sub "requires?" "RabbitMQ"
+
+    _tfhow_project_has_kafka "$project" &&
+        _tf_sub "requires?" "Kafka"
+
+    _tfhow_project_has_grpc "$project" &&
+        _tf_sub "uses" "gRPC"
+
+    _tfhow_project_has_auth "$project" &&
+        _tf_sub "uses" "authentication / authorization"
+
+    if [[ -n "$urls" ]]; then
+        while IFS= read -r url; do
+            [[ -z "$url" ]] && continue
+            _tf_sub "URL" "$url"
+        done <<< "$urls"
+    fi
+}
+
+
+_tfhow_project_blockers() {
+    local project="$1"
+
+    local migrations=0
+    local keys=""
+    local count=0
+
+    migrations="$(_tfhow_project_migration_count "$project")"
+    keys="$(_tfhow_project_connection_keys "$project")"
+
+    _tfhow_header "$(_tfhow_project_name "$project")"
+
+    if [[ -n "$keys" ]]; then
+        while IFS= read -r key; do
+            [[ -z "$key" ]] && continue
+
+            if ! _tfhow_config_key_exists "$key" &&
+               ! _tfhow_env_key_exists "$key"
+            then
+                _tfhow_medium \
+                    "connection '$key' is not present in tracked configuration"
+                (( count++ ))
+            fi
+        done <<< "$keys"
+    fi
+
+    if (( migrations > 0 )) &&
+       ! _tfhow_project_has_auto_migrate "$project" &&
+       ! _tfhow_project_has_ensure_created "$project"
+    then
+        _tfhow_medium \
+            "$migrations migrations exist; this project does not appear to apply them"
+        (( count++ ))
+    fi
+
+    if _tfhow_project_has_redis "$project"; then
+        _tfhow_low "Redis dependency should be verified"
+        (( count++ ))
+    fi
+
+    if _tfhow_project_has_rabbit "$project"; then
+        _tfhow_low "RabbitMQ dependency should be verified"
+        (( count++ ))
+    fi
+
+    if _tfhow_project_has_kafka "$project"; then
+        _tfhow_low "Kafka dependency should be verified"
+        (( count++ ))
+    fi
+
+    (( count == 0 )) &&
+        _tfhow_fact "No obvious static blockers"
+}
+
+
+_tfhow_project_order() {
+    local project="$1"
+
+    local step=1
+    local keys=""
+    local migrations=0
+
+    keys="$(_tfhow_project_connection_keys "$project")"
+    migrations="$(_tfhow_project_migration_count "$project")"
+
+    _tfhow_header "$(_tfhow_project_name "$project")"
+
+    if _tfhow_project_has_redis "$project" ||
+       _tfhow_project_has_rabbit "$project" ||
+       _tfhow_project_has_kafka "$project"
+    then
+        _tfhow_step "$step" "Verify/start required infrastructure"
+
+        _tfhow_project_has_redis "$project" &&
+            _tf_sub "service" "Redis"
+
+        _tfhow_project_has_rabbit "$project" &&
+            _tf_sub "service" "RabbitMQ"
+
+        _tfhow_project_has_kafka "$project" &&
+            _tf_sub "service" "Kafka"
+
+        (( step++ ))
+    fi
+
+    if [[ -n "$keys" ]]; then
+        _tfhow_step "$step" "Resolve required connection strings"
+
+        while IFS= read -r key; do
+            [[ -z "$key" ]] && continue
+            _tf_sub "connection" "$key"
+        done <<< "$keys"
+
+        (( step++ ))
+    fi
+
+    if (( migrations > 0 )); then
+        _tfhow_step "$step" "Verify database schema state"
+
+        if _tfhow_project_has_auto_migrate "$project"; then
+            _tf_sub "behavior" "startup migration detected"
+        elif _tfhow_project_has_ensure_created "$project"; then
+            _tf_sub "behavior" "EnsureCreated detected"
+        else
+            _tf_sub "behavior" "schema appears externally prepared"
+            _tf_sub "warning" "do not blindly apply migrations"
+        fi
+
+        (( step++ ))
+    fi
+
+    _tfhow_step "$step" "Run project"
+
+    _tf_sub "command" \
+        "dotnet run --project $project"
+}
 _tfhow_files() {
     fd -t f \
         --exclude bin \
@@ -4523,91 +5205,150 @@ tfhow() {
     # STARTUP
     # ========================================================================
 
+  
     startup|start)
 
-        _tf_title "STARTUP PROJECT ANALYSIS"
+        _tf_title "SOLUTION STARTUP MAP"
 
-        local candidates=""
-        candidates="$(_tfhow_startup_candidates)"
+        local runnable=""
+        local libraries=""
+        local tests=""
+        local apphosts=""
 
+        runnable="$(_tfhow_runnable_projects)"
+        libraries="$(_tfhow_library_projects)"
+        tests="$(_tfhow_test_projects)"
+        apphosts="$(_tfhow_apphosts)"
 
-        if [[ -z "$candidates" ]]; then
+        _tf_section "Runnable Projects"
 
-            _tf_warn "startup" \
-                "no obvious startup project detected"
+        if [[ -n "$runnable" ]]; then
 
-            return
+            while IFS= read -r project; do
+                [[ -z "$project" ]] && continue
+                _tfhow_print_project_summary "$project"
+            done <<< "$runnable"
 
+        else
+            _tf_warn "startup" "no runnable projects detected"
         fi
 
 
-        _tf_section "Candidates"
+        if [[ -n "$apphosts" ]]; then
 
-        local rank=0
+            _tf_section "Orchestration"
 
-        while IFS='|' read -r score file reason; do
+            while IFS= read -r apphost; do
+                [[ -z "$apphost" ]] && continue
 
-            [[ -z "$file" ]] && continue
+                _tfhow_header "$(_tfhow_project_name "$apphost")"
 
-            (( rank++ ))
+                _tf_label "role"
+                _tf_cfgval "Aspire AppHost"
 
-            _tfhow_header "$file"
+                _tf_label "run"
+                _tf_cfgval "dotnet run --project $apphost"
 
-            _tf_label "rank"
-            _tf_value "$rank"
+                local children=""
+                children="$(_tfhow_apphost_children "$apphost")"
 
-            _tf_label "score"
-            _tf_value "$score"
-
-            _tf_label "type"
-            _tf_value "$(_tfhow_project_type "$file")"
-
-            local framework=""
-            framework="$(_tfhow_framework "$file")"
-
-            [[ -n "$framework" ]] && {
-                _tf_label "framework"
-                _tf_value "$framework"
-            }
-
-            _tf_label "evidence"
-            _tf_cfgval "$reason"
-
-        done <<< "$candidates"
+                if [[ -n "$children" ]]; then
+                    while IFS= read -r child; do
+                        [[ -z "$child" ]] && continue
+                        _tf_sub "orchestrates" "$child"
+                    done <<< "$children"
+                fi
+            done <<< "$apphosts"
+        fi
 
 
-        # --------------------------------------------------------------------
-        # PROGRAM.CS
-        # --------------------------------------------------------------------
+        _tf_section "Libraries"
 
-        _tf_section "Startup Entry Points"
+        if [[ -n "$libraries" ]]; then
+            while IFS= read -r project; do
+                [[ -z "$project" ]] && continue
 
-        fd \
-            '^Program\.cs$' \
-            --exclude bin \
-            --exclude obj \
-            . 2>/dev/null |
-        while IFS= read -r file; do
-
-            _tf_path "$file"
-
-        done
+                _tf_label "$(_tfhow_project_name "$project")"
+                _tf_pathval "$project"
+            done <<< "$libraries"
+        else
+            _tf_dim "None detected."
+        fi
 
 
-        # --------------------------------------------------------------------
-        # HOSTING STYLE
-        # --------------------------------------------------------------------
+        _tf_section "Tests"
 
-        _tf_section "Hosting Evidence"
+        if [[ -n "$tests" ]]; then
+            while IFS= read -r project; do
+                [[ -z "$project" ]] && continue
 
-        _tfhow_rg -n \
-            'WebApplication\.CreateBuilder|Host\.CreateDefaultBuilder|DistributedApplication\.CreateBuilder|CreateHostBuilder|app\.Run\(|host\.Run\(' \
-            -g '*.cs' \
-            . 2>/dev/null |
-        head -80
+                _tf_label "$(_tfhow_project_name "$project")"
+                _tf_pathval "$project"
+            done <<< "$tests"
+        else
+            _tf_dim "None detected."
+        fi
+
+
+        _tf_section "Project Relationships"
+
+        local project=""
+
+        while IFS= read -r project; do
+            [[ -z "$project" ]] && continue
+
+            local refs=""
+            refs="$(_tfhow_project_refs "$project")"
+
+            [[ -z "$refs" ]] && continue
+
+            _tfhow_header "$(_tfhow_project_name "$project")"
+
+            while IFS= read -r ref; do
+                [[ -z "$ref" ]] && continue
+                _tf_sub "references" "$ref"
+            done <<< "$refs"
+
+        done < <(_tfhow_csprojects)
+
+
+        local runnable_count=0
+
+        runnable_count="$(
+            printf '%s\n' "$runnable" |
+            sed '/^$/d' |
+            wc -l |
+            tr -d ' '
+        )"
+
+        _tf_section "Conclusion"
+
+        if [[ -n "$apphosts" ]]; then
+
+            _tfhow_fact \
+                "Aspire AppHost detected; it is the likely orchestration entry point"
+
+        elif (( runnable_count == 1 )); then
+
+            _tfhow_fact \
+                "one runnable project detected"
+
+        elif (( runnable_count > 1 )); then
+
+            _tfhow_question \
+                "$runnable_count runnable projects detected; no primary startup project assumed"
+
+            _tf_dim \
+                "Use: tfhow project <name>"
+
+        else
+
+            _tfhow_question \
+                "no runnable startup project identified"
+
+        fi
 
         ;;
-
 
     # ========================================================================
     # BLOCKERS
@@ -5900,7 +6641,174 @@ tfhow() {
 
         ;;
 
+    # ========================================================================
+    # PROJECT
+    # ========================================================================
 
+    project|proj)
+
+        local query="$1"
+        local action="${2:-summary}"
+
+        if [[ -z "$query" ]]; then
+            echo "Usage:"
+            echo "  tfhow project <name|path>"
+            echo "  tfhow project <name|path> blockers"
+            echo "  tfhow project <name|path> order"
+            echo "  tfhow project <name|path> evidence"
+            return 1
+        fi
+
+        local result=""
+        result="$(_tfhow_resolve_project "$query")"
+        local rc=$?
+
+        if (( rc == 2 )); then
+
+            _tf_title "AMBIGUOUS PROJECT"
+
+            printf '%s\n' "$result" |
+                tail -n +2 |
+                while IFS= read -r project; do
+                    [[ -z "$project" ]] && continue
+                    _tf_path "$project"
+                done
+
+            printf '\n'
+            _tf_warn "project" \
+                "use a more specific name or csproj path"
+
+            return 2
+
+        elif (( rc != 0 )) || [[ -z "$result" ]]; then
+
+            _tf_bad "project" \
+                "could not resolve '$query'"
+
+            return 1
+        fi
+
+        local project="$result"
+
+        case "$action" in
+
+            summary|overview|ov)
+
+                _tf_title "HOW TF: $(_tfhow_project_name "$project")"
+
+                _tfhow_print_project_summary "$project"
+
+                _tf_section "Blockers"
+                _tfhow_project_blockers "$project"
+
+                _tf_section "Likely Startup Order"
+                _tfhow_project_order "$project"
+
+                ;;
+
+
+            blockers|blocker)
+
+                _tf_title "PROJECT BLOCKERS"
+                _tfhow_project_blockers "$project"
+
+                ;;
+
+
+            order|sequence)
+
+                _tf_title "PROJECT STARTUP ORDER"
+                _tfhow_project_order "$project"
+
+                ;;
+
+
+            evidence|ev)
+
+                _tf_title "PROJECT STARTUP EVIDENCE"
+
+                _tf_label "project"
+                _tf_pathval "$project"
+
+                _tf_section "Startup"
+
+                _tfhow_scope_rg "$project" \
+                    -n \
+                    'CreateBuilder|CreateHostBuilder|AddDbContext|AddNpgsqlDbContext|AddSqlServerDbContext|AddRedis|AddStackExchangeRedis|AddAuthentication|AddAuthorization|AddGrpc|MapGrpcService|app\.Run\(' \
+                    -g '*.cs' \
+                    2>/dev/null |
+                head -150
+
+                _tf_section "Configuration"
+
+                _tfhow_scope_rg "$project" \
+                    -n \
+                    'GetConnectionString|GetSection|GetEnvironmentVariable|AddJsonFile|AddEnvironmentVariables' \
+                    -g '*.cs' \
+                    2>/dev/null |
+                head -150
+
+                _tf_section "Schema"
+
+                _tfhow_scope_rg "$project" \
+                    -n \
+                    'Database\.Migrate|EnsureCreated|EnsureDeleted' \
+                    -g '*.cs' \
+                    2>/dev/null |
+                head -100
+
+                ;;
+
+
+            *)
+
+                echo "Unknown project action: $action"
+                echo
+                echo "Supported:"
+                echo "  summary"
+                echo "  blockers"
+                echo "  order"
+                echo "  evidence"
+
+                return 1
+                ;;
+
+        esac
+
+        ;;
+
+
+    # ========================================================================
+    # ALL RUNNABLE PROJECTS
+    # ========================================================================
+
+    all)
+
+        _tf_title "ALL RUNNABLE PROJECTS"
+
+        local runnable=""
+        runnable="$(_tfhow_runnable_projects)"
+
+        if [[ -z "$runnable" ]]; then
+            _tf_warn "startup" "no runnable projects detected"
+            return
+        fi
+
+        while IFS= read -r project; do
+
+            [[ -z "$project" ]] && continue
+
+            _tfhow_print_project_summary "$project"
+
+            printf '\n'
+
+            _tf_sub "blockers" ""
+
+            _tfhow_project_blockers "$project"
+
+        done <<< "$runnable"
+
+        ;;
     # ========================================================================
     # HELP
     # ========================================================================
