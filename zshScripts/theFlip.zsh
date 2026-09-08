@@ -1,25 +1,315 @@
-# theflip.zsh
-# Deterministic project archaeology for C#/.NET, JavaScript/TypeScript, and XML.
-# Commands: tfcs, tfjs, tfx
+# ==============================================================================
 #
-# Core dependencies:
-#   rg fd tokei git
-# Recommended:
-#   jq column
+#   THEFLIP
+#   "What the fk is this, and how the fk do I run it?"
 #
-# Optional .NET-aware tooling:
-#   roslynator       - deeper Roslyn-backed source analysis when installed
-#   dotnet           - SDK/project metadata, package vulnerability checks, format/analyzer verification
-#   csharpier        - detected and surfaced when installed
+#   Deterministic project archaeology for inherited, unfamiliar,
+#   and questionably documented codebases.
 #
-# This file is intentionally read-only against the inspected repository.
-# It does not run format/fix, migrations, package installs, database updates, or writes.
+#   No LLMs. No embeddings. No guessing. No touching shit.
+#   Just source code, configuration, structure, and evidence.
 #
-# Install:
-#   source /path/to/theFlip.zsh
-# or:
-#   echo 'source /path/to/theflip.zsh' >> ~/.zshrc
+# ------------------------------------------------------------------------------
+#
+#   COMMANDS
+#
+#     tfcs      C# / .NET archaeology
+#               projects, dependencies, EF, DI, APIs, config, migrations
+#
+#     tfjs      JavaScript / TypeScript archaeology
+#               packages, frameworks, APIs, data, scripts, config
+#
+#     tfx       XML / MSBuild archaeology
+#               csproj, props, targets, config, schemas, references
+#
+#     tfhow     Startup archaeology
+#               "How TF do I actually run this?"
+#               startup projects, blockers, infrastructure, config,
+#               databases, migrations, secrets, ports, startup order
+#
+#     tfcheck   Check TheFlip's external tool dependencies
+#
+#     tfinstall Install missing TheFlip dependencies
+#
+# ------------------------------------------------------------------------------
+#
+#   PHILOSOPHY
+#
+#     TheFlip is an investigation tool, not an automation framework.
+#
+#     FACT
+#       "17 EF migrations exist."
+#
+#     FACT
+#       "Database.Migrate() was not found."
+#
+#     INFERENCE
+#       "The database schema appears to be prepared externally."
+#
+#     NOT ASSUMED
+#       "Run dotnet ef database update."
+#
+#     Normal commands summarize and explain.
+#     `why` shows the evidence behind a conclusion.
+#     `raw` gives you the firehose when you actually want it.
+#
+# ------------------------------------------------------------------------------
+#
+#   SAFETY
+#
+#     READ-ONLY BY DEFAULT.
+#
+#     TheFlip may inspect files, Git metadata, project metadata, and installed
+#     tooling. Analysis commands should not:
+#
+#       - modify source files
+#       - modify configuration
+#       - apply or create migrations
+#       - start applications
+#       - start or stop containers
+#       - mutate databases
+#       - read secret values
+#       - install packages
+#
+#     tfinstall is the explicit exception: its entire purpose is installation.
+#
+# ------------------------------------------------------------------------------
+#
+#   BASIC USAGE
+#
+#     cd inherited-disaster
+#
+#     tfcs
+#     tfjs
+#     tfx
+#     tfhow
+#
+#     tfhow startup
+#     tfhow blockers
+#     tfhow project Some.Api
+#     tfhow project Some.Api order
+#
+#     tfcs why ApplicationDbContext
+#     tfhow why MainDatabase
+#
+# ------------------------------------------------------------------------------
+#
+#   RULE #1
+#
+#     If the repository doesn't prove it, TheFlip shouldn't pretend it knows it.
+#
+# ==============================================================================
 
+tfcheck() {
+    local tools=(
+        rg
+        fd
+        jq
+        git
+        tokei
+        xmlstarlet
+        yq
+        dotnet
+        roslynator
+        csharpier
+        node
+        npm
+        pnpm
+        yarn
+        bun
+        column
+    )
+
+    local found=0
+    local missing=0
+
+    printf '\n\033[1;96m'
+    printf '━%.0s' {1..72}
+    printf '\n  THEFLIP TOOL CHECK\n'
+    printf '━%.0s' {1..72}
+    printf '\033[0m\n\n'
+
+    for cmd in "${tools[@]}"; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            printf '  \033[92m✓\033[0m \033[1m%-14s\033[0m \033[2m%s\033[0m\n' \
+                "$cmd" "$(command -v "$cmd")"
+            (( found++ ))
+        else
+            printf '  \033[91m✗\033[0m \033[1m%-14s\033[0m \033[91mMISSING\033[0m\n' \
+                "$cmd"
+            (( missing++ ))
+        fi
+    done
+
+    printf '\n\033[1;96m────────────────────────────────────────────────────────────────────────\033[0m\n'
+
+    if (( missing == 0 )); then
+        printf '  \033[92m✓ All %d tools available\033[0m\n\n' "$found"
+    else
+        printf '  \033[92m%d available\033[0m  \033[91m%d missing\033[0m\n\n' \
+            "$found" "$missing"
+    fi
+}
+tfinstall() {
+    printf '\n\033[1;96m'
+    printf '━%.0s' {1..72}
+    printf '\n  THEFLIP TOOL INSTALLER\n'
+    printf '━%.0s' {1..72}
+    printf '\033[0m\n\n'
+
+    # ------------------------------------------------------------------------
+    # Fedora / Ultramarine packages
+    # command:package
+    # ------------------------------------------------------------------------
+
+    local system_tools=(
+        "rg:ripgrep"
+        "fd:fd-find"
+        "jq:jq"
+        "git:git"
+        "tokei:tokei"
+        "xmlstarlet:xmlstarlet"
+        "yq:yq"
+        "dotnet:dotnet-sdk-10.0"
+        "node:nodejs"
+        "npm:npm"
+        "column:util-linux"
+    )
+
+    local packages=()
+    local entry cmd package
+
+    printf '\033[1;96m◆ System tools\033[0m\n'
+
+    for entry in "${system_tools[@]}"; do
+        cmd="${entry%%:*}"
+        package="${entry#*:}"
+
+        if command -v "$cmd" >/dev/null 2>&1; then
+            printf '  \033[92m✓\033[0m %-14s already installed\n' "$cmd"
+        else
+            printf '  \033[93m+\033[0m %-14s %s\n' "$cmd" "$package"
+            packages+=("$package")
+        fi
+    done
+
+    if (( ${#packages[@]} > 0 )); then
+        printf '\n  Installing missing system packages...\n\n'
+
+        if ! sudo dnf install -y "${packages[@]}"; then
+            printf '\n  \033[91m✗ dnf installation failed\033[0m\n'
+        fi
+    else
+        printf '\n  \033[92m✓ No system packages needed\033[0m\n'
+    fi
+
+
+    # ------------------------------------------------------------------------
+    # .NET global tools
+    # ------------------------------------------------------------------------
+
+    printf '\n\033[1;96m◆ .NET tools\033[0m\n'
+
+    export PATH="$PATH:$HOME/.dotnet/tools"
+
+    if command -v dotnet >/dev/null 2>&1; then
+
+        if command -v roslynator >/dev/null 2>&1; then
+            printf '  \033[92m✓\033[0m %-14s already installed\n' "roslynator"
+        else
+            printf '  \033[93m+\033[0m Installing Roslynator\n'
+            dotnet tool install --global roslynator.dotnet.cli
+        fi
+
+        if command -v csharpier >/dev/null 2>&1; then
+            printf '  \033[92m✓\033[0m %-14s already installed\n' "csharpier"
+        else
+            printf '  \033[93m+\033[0m Installing CSharpier\n'
+            dotnet tool install --global csharpier
+        fi
+
+    else
+        printf '  \033[91m✗ dotnet unavailable; skipping .NET tools\033[0m\n'
+    fi
+
+
+    # ------------------------------------------------------------------------
+    # JS package managers
+    # ------------------------------------------------------------------------
+
+    printf '\n\033[1;96m◆ JavaScript tooling\033[0m\n'
+
+    if command -v node >/dev/null 2>&1; then
+
+        # pnpm
+        if command -v pnpm >/dev/null 2>&1; then
+            printf '  \033[92m✓\033[0m %-14s already installed\n' "pnpm"
+        elif command -v corepack >/dev/null 2>&1; then
+            printf '  \033[93m+\033[0m Enabling pnpm via Corepack\n'
+            corepack enable
+            corepack prepare pnpm@latest --activate
+        elif command -v npm >/dev/null 2>&1; then
+            printf '  \033[93m+\033[0m Installing pnpm via npm\n'
+            npm install -g pnpm
+        fi
+
+        # yarn
+        if command -v yarn >/dev/null 2>&1; then
+            printf '  \033[92m✓\033[0m %-14s already installed\n' "yarn"
+        elif command -v corepack >/dev/null 2>&1; then
+            printf '  \033[93m+\033[0m Enabling yarn via Corepack\n'
+            corepack enable
+            corepack prepare yarn@stable --activate
+        elif command -v npm >/dev/null 2>&1; then
+            printf '  \033[93m+\033[0m Installing yarn via npm\n'
+            npm install -g yarn
+        fi
+
+    else
+        printf '  \033[91m✗ node unavailable; skipping JS package managers\033[0m\n'
+    fi
+
+
+    # ------------------------------------------------------------------------
+    # Bun
+    # ------------------------------------------------------------------------
+
+    printf '\n\033[1;96m◆ Optional runtimes\033[0m\n'
+
+    if command -v bun >/dev/null 2>&1; then
+        printf '  \033[92m✓\033[0m %-14s already installed\n' "bun"
+    elif command -v curl >/dev/null 2>&1; then
+        printf '  \033[93m+\033[0m Installing Bun\n'
+        curl -fsSL https://bun.sh/install | bash
+    else
+        printf '  \033[91m✗ curl missing; cannot install Bun\033[0m\n'
+    fi
+
+
+    # ------------------------------------------------------------------------
+    # fd compatibility
+    # ------------------------------------------------------------------------
+
+    if ! command -v fd >/dev/null 2>&1 &&
+       command -v fdfind >/dev/null 2>&1; then
+
+        mkdir -p "$HOME/.local/bin"
+        ln -sf "$(command -v fdfind)" "$HOME/.local/bin/fd"
+
+        printf '\n  \033[92m✓\033[0m Created fd → fdfind compatibility shim\n'
+    fi
+
+
+    # ------------------------------------------------------------------------
+    # Finish
+    # ------------------------------------------------------------------------
+
+    export PATH="$HOME/.local/bin:$HOME/.dotnet/tools:$HOME/.bun/bin:$PATH"
+
+    printf '\n\033[1;96m────────────────────────────────────────────────────────────────────────\033[0m\n'
+    printf '  \033[92mInstallation pass complete.\033[0m\n'
+    printf '  Run \033[1;96mtfcheck\033[0m to verify everything.\n\n'
+}
 # ============================================================================
 # COLOR / OUTPUT
 # ============================================================================
